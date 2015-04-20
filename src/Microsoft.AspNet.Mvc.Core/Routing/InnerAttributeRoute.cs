@@ -3,281 +3,364 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.AspNet.Mvc.Core;
-using Microsoft.AspNet.Mvc.Internal.Routing;
-using Microsoft.AspNet.Routing;
-using Microsoft.AspNet.Routing.Template;
+using Microsoft.AspNet.Http;
+using Microsoft.Framework.DependencyInjection;
 using Microsoft.Framework.Internal;
 using Microsoft.Framework.Logging;
 
-namespace Microsoft.AspNet.Mvc.Routing
+namespace Microsoft.AspNet.Routing.Template
 {
-    /// <summary>
-    /// An <see cref="IRouter"/> implementation for attribute routing.
-    /// </summary>
-    public class InnerAttributeRoute : IRouter
+    public class InnerAttributeRoute : INamedRouter
     {
-        private readonly IRouter _next;
-        private readonly LinkGenerationDecisionTree _linkGenerationTree;
-        private readonly TemplateRoute[] _matchingRoutes;
-        private readonly IDictionary<string, AttributeRouteLinkGenerationEntry> _namedEntries;
+        /// <summary>
+        /// An empty, cached instance of <see cref="RouteValueDictionary"/>.
+        /// </summary>
+        internal static readonly IReadOnlyDictionary<string, object> _EmptyRouteValueDictionary =
+            new RouteValueDictionary();
 
+        private readonly IReadOnlyDictionary<string, IRouteConstraint> _constraints;
+        private readonly IReadOnlyDictionary<string, object> _dataTokens;
+        private readonly IReadOnlyDictionary<string, object> _defaults;
+        private readonly IRouter _target;
+        private readonly RouteTemplate _parsedTemplate;
+        private readonly string _routeTemplate;
+        private readonly TemplateMatcher _matcher;
+        private readonly TemplateBinder _binder;
         private ILogger _logger;
         private ILogger _constraintLogger;
 
-        /// <summary>
-        /// Creates a new <see cref="InnerAttributeRoute"/>.
-        /// </summary>
-        /// <param name="next">The next router. Invoked when a route entry matches.</param>
-        /// <param name="entries">The set of route entries.</param>
         public InnerAttributeRoute(
-            [NotNull] IRouter next,
-            [NotNull] IEnumerable<AttributeRouteMatchingEntry> matchingEntries,
-            [NotNull] IEnumerable<AttributeRouteLinkGenerationEntry> linkGenerationEntries,
-            [NotNull] ILogger logger,
-            [NotNull] ILogger constraintLogger,
-            int version)
+            [NotNull] IRouter target,
+            string routeTemplate,
+            IInlineConstraintResolver inlineConstraintResolver)
+                        : this(target,
+                               routeTemplate,
+                               defaults: null,
+                               constraints: null,
+                               dataTokens: null,
+                               inlineConstraintResolver: inlineConstraintResolver)
         {
-            _next = next;
-            _logger = logger;
-            _constraintLogger = constraintLogger;
+        }
 
-            Version = version;
+        public InnerAttributeRoute([NotNull] IRouter target,
+                             string routeTemplate,
+                             IDictionary<string, object> defaults,
+                             IDictionary<string, object> constraints,
+                             IDictionary<string, object> dataTokens,
+                             IInlineConstraintResolver inlineConstraintResolver)
+            : this(target, null, routeTemplate, defaults, constraints, dataTokens, inlineConstraintResolver)
+        {
+        }
 
-            // Order all the entries by order, then precedence, and then finally by template in order to provide
-            // a stable routing and link generation order for templates with same order and precedence.
-            // We use ordinal comparison for the templates because we only care about them being exactly equal and
-            // we don't want to make any equivalence between templates based on the culture of the machine.
+        public InnerAttributeRoute([NotNull] IRouter target,
+                             string routeName,
+                             string routeTemplate,
+                             IDictionary<string, object> defaults,
+                             IDictionary<string, object> constraints,
+                             IDictionary<string, object> dataTokens,
+                             IInlineConstraintResolver inlineConstraintResolver)
+        {
+            _target = target;
+            _routeTemplate = routeTemplate ?? string.Empty;
+            Name = routeName;
 
-            _matchingRoutes = matchingEntries
-                .OrderBy(o => o.Order)
-                .ThenBy(e => e.Precedence)
-                .ThenBy(e => e.Route.RouteTemplate, StringComparer.Ordinal)
-                .Select(e => e.Route)
-                .ToArray();
+            _dataTokens = dataTokens == null ? _EmptyRouteValueDictionary : new RouteValueDictionary(dataTokens);
 
-            var namedEntries = new Dictionary<string, AttributeRouteLinkGenerationEntry>(
-                StringComparer.OrdinalIgnoreCase);
+            // Data we parse from the template will be used to fill in the rest of the constraints or
+            // defaults. The parser will throw for invalid routes.
+            _parsedTemplate = TemplateParser.Parse(RouteTemplate);
 
-            foreach (var entry in linkGenerationEntries)
-            {
-                // Skip unnamed entries
-                if (entry.Name == null)
-                {
-                    continue;
-                }
+            _constraints = GetConstraints(inlineConstraintResolver, RouteTemplate, _parsedTemplate, constraints);
+            _defaults = GetDefaults(_parsedTemplate, defaults);
 
-                // We only need to keep one AttributeRouteLinkGenerationEntry per route template
-                // so in case two entries have the same name and the same template we only keep
-                // the first entry.
-                AttributeRouteLinkGenerationEntry namedEntry = null;
-                if (namedEntries.TryGetValue(entry.Name, out namedEntry) &&
-                    !namedEntry.TemplateText.Equals(entry.TemplateText, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new ArgumentException(
-                        Resources.FormatAttributeRoute_DifferentLinkGenerationEntries_SameName(entry.Name),
-                        "linkGenerationEntries");
-                }
-                else if (namedEntry == null)
-                {
-                    namedEntries.Add(entry.Name, entry);
-                }
-            }
+            _matcher = new TemplateMatcher(_parsedTemplate, Defaults);
+            _binder = new TemplateBinder(_parsedTemplate, Defaults);
+        }
 
-            _namedEntries = namedEntries;
+        public string Name { get; private set; }
 
-            // The decision tree will take care of ordering for these entries.
-            _linkGenerationTree = new LinkGenerationDecisionTree(linkGenerationEntries.ToArray());
+        public IReadOnlyDictionary<string, object> Defaults
+        {
+            get { return _defaults; }
+        }
+
+        public IReadOnlyDictionary<string, object> DataTokens
+        {
+            get { return _dataTokens; }
+        }
+
+        public string RouteTemplate
+        {
+            get { return _routeTemplate; }
+        }
+
+        public IReadOnlyDictionary<string, IRouteConstraint> Constraints
+        {
+            get { return _constraints; }
         }
 
         /// <summary>
-        /// Gets the version of this route. This corresponds to the value of
-        /// <see cref="ActionDescriptorsCollection.Version"/> when this route was created.
+        /// The order of the template.
         /// </summary>
-        public int Version { get; }
+        public int Order { get; set; }
 
-        /// <inheritdoc />
-        public async Task RouteAsync([NotNull] RouteContext context)
+        /// <summary>
+        /// The precedence of the template.
+        /// </summary>
+        public decimal Precedence { get; set; }
+
+        public async virtual Task RouteAsync([NotNull] RouteContext context)
         {
-            foreach (var route in _matchingRoutes)
+            EnsureLoggers(context.HttpContext);
+
+            var requestPath = context.HttpContext.Request.Path.Value;
+
+            if (!string.IsNullOrEmpty(requestPath) && requestPath[0] == '/')
             {
-                var oldRouteData = context.RouteData;
-
-                var newRouteData = new RouteData(oldRouteData);
-                newRouteData.Routers.Add(route);
-
-                try
-                {
-                    context.RouteData = newRouteData;
-                    await route.RouteAsync(context);
-                }
-                finally
-                {
-                    if (!context.IsHandled)
-                    {
-                        context.RouteData = oldRouteData;
-                    }
-                }
-
-                if (context.IsHandled)
-                {
-                    break;
-                }
+                requestPath = requestPath.Substring(1);
             }
 
-            if (!context.IsHandled)
-            {
-                _logger.LogVerbose("Request did not match any attribute route.");
-            }
-        }
+            var values = _matcher.Match(requestPath);
 
-        /// <inheritdoc />
-        public VirtualPathData GetVirtualPath([NotNull] VirtualPathContext context)
-        {
-            // If it's a named route we will try to generate a link directly and
-            // if we can't, we will not try to generate it using an unnamed route.
-            if (context.RouteName != null)
+            if (values == null)
             {
-                return GetVirtualPathForNamedRoute(context);
+                // If we got back a null value set, that means the URI did not match
+                return;
             }
 
-            // The decision tree will give us back all entries that match the provided route data in the correct
-            // order. We just need to iterate them and use the first one that can generate a link.
-            var matches = _linkGenerationTree.GetMatches(context);
+            var oldRouteData = context.RouteData;
 
-            foreach (var match in matches)
-            {
-                var path = GenerateVirtualPath(context, match.Entry);
-                if (path != null)
-                {
-                    context.IsBound = true;
-                    return path;
-                }
-            }
+            var newRouteData = new RouteData(oldRouteData);
+            MergeValues(newRouteData.DataTokens, _dataTokens);
+            newRouteData.Routers.Add(_target);
+            MergeValues(newRouteData.Values, values);
 
-            return null;
-        }
-
-        private VirtualPathData GetVirtualPathForNamedRoute(VirtualPathContext context)
-        {
-            AttributeRouteLinkGenerationEntry entry;
-            if (_namedEntries.TryGetValue(context.RouteName, out entry))
-            {
-                var path = GenerateVirtualPath(context, entry);
-                if (path != null)
-                {
-                    context.IsBound = true;
-                    return path;
-                }
-            }
-            return null;
-        }
-
-        private VirtualPathData GenerateVirtualPath(VirtualPathContext context, AttributeRouteLinkGenerationEntry entry)
-        {
-            // In attribute the context includes the values that are used to select this entry - typically
-            // these will be the standard 'action', 'controller' and maybe 'area' tokens. However, we don't
-            // want to pass these to the link generation code, or else they will end up as query parameters.
-            //
-            // So, we need to exclude from here any values that are 'required link values', but aren't
-            // parameters in the template.
-            //
-            // Ex:
-            //      template: api/Products/{action}
-            //      required values: { id = "5", action = "Buy", Controller = "CoolProducts" }
-            //
-            //      result: { id = "5", action = "Buy" }
-            var inputValues = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kvp in context.Values)
-            {
-                if (entry.RequiredLinkValues.ContainsKey(kvp.Key))
-                {
-                    var parameter = entry.Template.Parameters
-                        .FirstOrDefault(p => string.Equals(p.Name, kvp.Key, StringComparison.OrdinalIgnoreCase));
-
-                    if (parameter == null)
-                    {
-                        continue;
-                    }
-                }
-
-                inputValues.Add(kvp.Key, kvp.Value);
-            }
-
-            var bindingResult = entry.Binder.GetValues(context.AmbientValues, inputValues);
-            if (bindingResult == null)
-            {
-                // A required parameter in the template didn't get a value.
-                return null;
-            }
-
-            var matched = RouteConstraintMatcher.Match(
-                entry.Constraints,
-                bindingResult.CombinedValues,
-                context.Context,
+            if (!RouteConstraintMatcher.Match(
+                Constraints,
+                newRouteData.Values,
+                context.HttpContext,
                 this,
-                RouteDirection.UrlGeneration,
-                _constraintLogger);
-
-            if (!matched)
+                RouteDirection.IncomingRequest,
+                _constraintLogger))
             {
-                // A constraint rejected this link.
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(Name))
+            {
+                _logger.LogInformation(
+                    "Request successfully matched the route with name '{RouteName}' and template '{RouteTemplate}'.",
+                    Name,
+                    RouteTemplate);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Request successfully matched the route with template '{RouteTemplate}'.",
+                    RouteTemplate);
+            }
+
+            try
+            {
+                context.RouteData = newRouteData;
+
+                await _target.RouteAsync(context);
+            }
+            finally
+            {
+                // Restore the original values to prevent polluting the route data.
+                if (!context.IsHandled)
+                {
+                    context.RouteData = oldRouteData;
+                }
+            }
+        }
+
+        public virtual VirtualPathData GetVirtualPath(VirtualPathContext context)
+        {
+            var values = _binder.GetValues(context.AmbientValues, context.Values);
+            if (values == null)
+            {
+                // We're missing one of the required values for this route.
                 return null;
             }
 
-            // These values are used to signal to the next route what we would produce if we round-tripped
-            // (generate a link and then parse). In MVC the 'next route' is typically the MvcRouteHandler.
-            var providedValues = new Dictionary<string, object>(
-                bindingResult.AcceptedValues,
-                StringComparer.OrdinalIgnoreCase);
-            providedValues.Add(AttributeRouting.RouteGroupKey, entry.RouteGroup);
+            EnsureLoggers(context.Context);
+            if (!RouteConstraintMatcher.Match(Constraints,
+                                              values.CombinedValues,
+                                              context.Context,
+                                              this,
+                                              RouteDirection.UrlGeneration,
+                                              _constraintLogger))
+            {
+                return null;
+            }
 
-            var childContext = new VirtualPathContext(context.Context, context.AmbientValues, context.Values)
+            // Validate that the target can accept these values.
+            var childContext = CreateChildVirtualPathContext(context, values.AcceptedValues);
+
+            var pathData = _target.GetVirtualPath(childContext);
+            if (pathData != null)
+            {
+                // If the target generates a value then that can short circuit.
+                return pathData;
+            }
+
+            // If we can produce a value go ahead and do it, the caller can check context.IsBound
+            // to see if the values were validated.
+
+            // When we still cannot produce a value, this should return null.
+            var tempPath = _binder.BindValues(values.AcceptedValues);
+            if (tempPath == null)
+            {
+                return null;
+            }
+
+            pathData = new VirtualPathData(this, tempPath);
+            if (DataTokens != null)
+            {
+                foreach (var dataToken in DataTokens)
+                {
+                    pathData.DataTokens.Add(dataToken.Key, dataToken.Value);
+                }
+            }
+
+            context.IsBound = childContext.IsBound;
+
+            return pathData;
+        }
+
+        private VirtualPathContext CreateChildVirtualPathContext(
+            VirtualPathContext context,
+            IDictionary<string, object> acceptedValues)
+        {
+            // We want to build the set of values that would be provided if this route were to generated
+            // a link and then immediately match it. This includes all the accepted parameter values, and
+            // the defaults. Accepted values that would go in the query string aren't included.
+            var providedValues = new RouteValueDictionary();
+
+            foreach (var parameter in _parsedTemplate.Parameters)
+            {
+                object value;
+                if (acceptedValues.TryGetValue(parameter.Name, out value))
+                {
+                    providedValues.Add(parameter.Name, value);
+                }
+            }
+
+            foreach (var kvp in _defaults)
+            {
+                if (!providedValues.ContainsKey(kvp.Key))
+                {
+                    providedValues.Add(kvp.Key, kvp.Value);
+                }
+            }
+
+            return new VirtualPathContext(context.Context, context.AmbientValues, context.Values)
             {
                 ProvidedValues = providedValues,
             };
-
-            var pathData = _next.GetVirtualPath(childContext);
-            if (pathData != null)
-            {
-                // If path is non-null then the target router short-circuited, we don't expect this
-                // in typical MVC scenarios.
-                return pathData;
-            }
-            else if (!childContext.IsBound)
-            {
-                // The target router has rejected these values. We don't expect this in typical MVC scenarios.
-                return null;
-            }
-
-            var path = entry.Binder.BindValues(bindingResult.AcceptedValues);
-            if (path == null)
-            {
-                return null;
-            }
-
-            return new VirtualPathData(this, path);
         }
 
-        private bool ContextHasSameValue(VirtualPathContext context, string key, object value)
+        private static IReadOnlyDictionary<string, IRouteConstraint> GetConstraints(
+            IInlineConstraintResolver inlineConstraintResolver,
+            string template,
+            RouteTemplate parsedTemplate,
+            IDictionary<string, object> constraints)
         {
-            object providedValue;
-            if (!context.Values.TryGetValue(key, out providedValue))
+            var constraintBuilder = new RouteConstraintBuilder(inlineConstraintResolver, template);
+
+            if (constraints != null)
             {
-                // If the required value is an 'empty' route value, then ignore ambient values.
-                // This handles a case where we're generating a link to an action like:
-                // { area = "", controller = "Home", action = "Index" }
-                //
-                // and the ambient values has a value for area.
-                if (value != null)
+                foreach (var kvp in constraints)
                 {
-                    context.AmbientValues.TryGetValue(key, out providedValue);
+                    constraintBuilder.AddConstraint(kvp.Key, kvp.Value);
                 }
             }
 
-            return TemplateBinder.RoutePartsEqual(providedValue, value);
+            foreach (var parameter in parsedTemplate.Parameters)
+            {
+                if (parameter.IsOptional)
+                {
+                    constraintBuilder.SetOptional(parameter.Name);
+                }
+
+                foreach (var inlineConstraint in parameter.InlineConstraints)
+                {
+                    constraintBuilder.AddResolvedConstraint(parameter.Name, inlineConstraint.Constraint);
+                }
+            }
+
+            return constraintBuilder.Build();
+        }
+
+        private static RouteValueDictionary GetDefaults(
+            RouteTemplate parsedTemplate,
+            IDictionary<string, object> defaults)
+        {
+            // Do not use RouteValueDictionary.Empty for defaults, it might be modified inside
+            // UpdateInlineDefaultValuesAndConstraints()
+            var result = defaults == null ? new RouteValueDictionary() : new RouteValueDictionary(defaults);
+
+            foreach (var parameter in parsedTemplate.Parameters)
+            {
+                if (parameter.DefaultValue != null)
+                {
+                    if (result.ContainsKey(parameter.Name))
+                    {
+                        throw new InvalidOperationException("FormatTemplateRoute_CannotHaveDefaultValueSpecifiedInlineAndExplicitly");
+                    }
+                    else
+                    {
+                        result.Add(parameter.Name, parameter.DefaultValue);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static void MergeValues(
+            IDictionary<string, object> destination,
+            IDictionary<string, object> values)
+        {
+            foreach (var kvp in values)
+            {
+                // This will replace the original value for the specified key.
+                // Values from the matched route will take preference over previous
+                // data in the route context.
+                destination[kvp.Key] = kvp.Value;
+            }
+        }
+
+        // Needed because IDictionary<> is not an IReadOnlyDictionary<>
+        private static void MergeValues(
+            IDictionary<string, object> destination,
+            IReadOnlyDictionary<string, object> values)
+        {
+            foreach (var kvp in values)
+            {
+                // This will replace the original value for the specified key.
+                // Values from the matched route will take preference over previous
+                // data in the route context.
+                destination[kvp.Key] = kvp.Value;
+            }
+        }
+
+        private void EnsureLoggers(HttpContext context)
+        {
+            if (_logger == null)
+            {
+                var factory = context.RequestServices.GetRequiredService<ILoggerFactory>();
+                _logger = factory.CreateLogger<TemplateRoute>();
+                _constraintLogger = factory.CreateLogger(typeof(RouteConstraintMatcher).FullName);
+            }
+        }
+
+        public override string ToString()
+        {
+            return _routeTemplate;
         }
     }
 }

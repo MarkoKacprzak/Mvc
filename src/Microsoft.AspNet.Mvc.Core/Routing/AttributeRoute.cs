@@ -3,10 +3,10 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNet.Mvc.Core;
+using Microsoft.AspNet.Mvc.Internal.Routing;
 using Microsoft.AspNet.Routing;
 using Microsoft.AspNet.Routing.Template;
 using Microsoft.Framework.Internal;
@@ -24,7 +24,9 @@ namespace Microsoft.AspNet.Mvc.Routing
         private readonly ILogger _routeLogger;
         private readonly ILogger _constraintLogger;
 
-        private InnerAttributeRoute _inner;
+        private RoutesForRequestMatch _routesForRequestMatch;
+        private IDictionary<string, AttributeRouteLinkGenerationEntry> _namedEntries;
+        private LinkGenerationDecisionTree _linkGenerationTree;
 
         public AttributeRoute(
             [NotNull] IRouter target,
@@ -41,43 +43,98 @@ namespace Microsoft.AspNet.Mvc.Routing
         }
 
         /// <inheritdoc />
-        public VirtualPathData GetVirtualPath(VirtualPathContext context)
+        public async Task RouteAsync(RouteContext context)
         {
-            var route = GetInnerRoute();
-            return route.GetVirtualPath(context);
+            var innerRoutes = GetInnerRoutes();
+
+            foreach (var route in innerRoutes)
+            {
+                var oldRouteData = context.RouteData;
+
+                var newRouteData = new RouteData(oldRouteData);
+                newRouteData.Routers.Add(route);
+
+                try
+                {
+                    context.RouteData = newRouteData;
+                    await route.RouteAsync(context);
+                }
+                finally
+                {
+                    if (!context.IsHandled)
+                    {
+                        context.RouteData = oldRouteData;
+                    }
+                }
+
+                if (context.IsHandled)
+                {
+                    break;
+                }
+            }
+
+            if (!context.IsHandled)
+            {
+                _routeLogger.LogVerbose("Request did not match any attribute route.");
+            }
         }
 
         /// <inheritdoc />
-        public Task RouteAsync(RouteContext context)
+        public VirtualPathData GetVirtualPath(VirtualPathContext context)
         {
-            var route = GetInnerRoute();
-            return route.RouteAsync(context);
+            // If it's a named route we will try to generate a link directly and
+            // if we can't, we will not try to generate it using an unnamed route.
+            if (context.RouteName != null)
+            {
+                return GetVirtualPathForNamedRoute(context);
+            }
+
+            // The decision tree will give us back all entries that match the provided route data in the correct
+            // order. We just need to iterate them and use the first one that can generate a link.
+            var matches = _linkGenerationTree.GetMatches(context);
+
+            foreach (var match in matches)
+            {
+                var path = GenerateVirtualPath(context, match.Entry);
+                if (path != null)
+                {
+                    context.IsBound = true;
+                    return path;
+                }
+            }
+
+            return null;
         }
 
-        private InnerAttributeRoute GetInnerRoute()
+        private IEnumerable<InnerAttributeRoute> GetInnerRoutes()
         {
             var actions = _actionDescriptorsCollectionProvider.ActionDescriptors;
 
             // This is a safe-race. We'll never set inner back to null after initializing
             // it on startup.
-            if (_inner == null || _inner.Version != actions.Version)
+            if(_routesForRequestMatch == null || _routesForRequestMatch.ActionsVersion != actions.Version)
             {
-                _inner = BuildRoute(actions);
+                var routes = BuildRoutes(actions);
+
+                _routesForRequestMatch = new RoutesForRequestMatch(routes, actions.Version);
             }
 
-            return _inner;
+            return _routesForRequestMatch.Routes
+                    .OrderBy(o => o.Order)
+                    .ThenBy(e => e.Precedence)
+                    .ThenBy(e => e.RouteTemplate, StringComparer.Ordinal);
         }
 
-        private InnerAttributeRoute BuildRoute(ActionDescriptorsCollection actions)
+        private IList<InnerAttributeRoute> BuildRoutes(ActionDescriptorsCollection actions)
         {
             var routeInfos = GetRouteInfos(_constraintResolver, actions.Items);
 
             // We're creating one AttributeRouteGenerationEntry per action. This allows us to match the intended
             // action by expected route values, and then use the TemplateBinder to generate the link.
-            var generationEntries = new List<AttributeRouteLinkGenerationEntry>();
+            var linkGenerationEntries = new List<AttributeRouteLinkGenerationEntry>();
             foreach (var routeInfo in routeInfos)
             {
-                generationEntries.Add(new AttributeRouteLinkGenerationEntry()
+                linkGenerationEntries.Add(new AttributeRouteLinkGenerationEntry()
                 {
                     Binder = new TemplateBinder(routeInfo.ParsedTemplate, routeInfo.Defaults),
                     Defaults = routeInfo.Defaults,
@@ -92,19 +149,47 @@ namespace Microsoft.AspNet.Mvc.Routing
                 });
             }
 
+            var namedEntries = new Dictionary<string, AttributeRouteLinkGenerationEntry>(
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var entry in linkGenerationEntries)
+            {
+                // Skip unnamed entries
+                if (entry.Name == null)
+                {
+                    continue;
+                }
+
+                // We only need to keep one AttributeRouteLinkGenerationEntry per route template
+                // so in case two entries have the same name and the same template we only keep
+                // the first entry.
+                AttributeRouteLinkGenerationEntry namedEntry = null;
+                if (namedEntries.TryGetValue(entry.Name, out namedEntry) &&
+                    !namedEntry.TemplateText.Equals(entry.TemplateText, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("FormatAttributeRoute_DifferentLinkGenerationEntries_SameName");
+                }
+                else if (namedEntry == null)
+                {
+                    namedEntries.Add(entry.Name, entry);
+                }
+            }
+
+            _namedEntries = namedEntries;
+
+            // The decision tree will take care of ordering for these entries.
+            _linkGenerationTree = new LinkGenerationDecisionTree(linkGenerationEntries.ToArray());
+
             // We're creating one AttributeRouteMatchingEntry per group, so we need to identify the distinct set of
             // groups. It's guaranteed that all members of the group have the same template and precedence,
             // so we only need to hang on to a single instance of the RouteInfo for each group.
             var distinctRouteInfosByGroup = GroupRouteInfosByGroupId(routeInfos);
-            var matchingEntries = new List<AttributeRouteMatchingEntry>();
+            var routesForRequestMatching = new List<InnerAttributeRoute>();
             foreach (var routeInfo in distinctRouteInfosByGroup)
             {
-                matchingEntries.Add(new AttributeRouteMatchingEntry()
-                {
-                    Order = routeInfo.Order,
-                    Precedence = routeInfo.Precedence,
-                    Route = new TemplateRoute(
+                routesForRequestMatching.Add(new InnerAttributeRoute(
                         _target,
+                        routeInfo.Name,
                         routeInfo.RouteTemplate,
                         defaults: new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
                         {
@@ -112,17 +197,15 @@ namespace Microsoft.AspNet.Mvc.Routing
                         },
                         constraints: null,
                         dataTokens: null,
-                        inlineConstraintResolver: _constraintResolver),
+                        inlineConstraintResolver: _constraintResolver
+                    )
+                {
+                    Order = routeInfo.Order,
+                    Precedence = routeInfo.Precedence
                 });
             }
 
-            return new InnerAttributeRoute(
-                _target,
-                matchingEntries,
-                generationEntries,
-                _routeLogger,
-                _constraintLogger,
-                actions.Version);
+            return routesForRequestMatching;
         }
 
         private static IEnumerable<RouteInfo> GroupRouteInfosByGroupId(List<RouteInfo> routeInfos)
@@ -280,6 +363,107 @@ namespace Microsoft.AspNet.Mvc.Routing
             return routeInfo;
         }
 
+        private VirtualPathData GetVirtualPathForNamedRoute(VirtualPathContext context)
+        {
+            AttributeRouteLinkGenerationEntry entry;
+            if (_namedEntries.TryGetValue(context.RouteName, out entry))
+            {
+                var path = GenerateVirtualPath(context, entry);
+                if (path != null)
+                {
+                    context.IsBound = true;
+                    return path;
+                }
+            }
+            return null;
+        }
+
+        private VirtualPathData GenerateVirtualPath(VirtualPathContext context,AttributeRouteLinkGenerationEntry entry)
+        {
+            // In attribute the context includes the values that are used to select this entry - typically
+            // these will be the standard 'action', 'controller' and maybe 'area' tokens. However, we don't
+            // want to pass these to the link generation code, or else they will end up as query parameters.
+            //
+            // So, we need to exclude from here any values that are 'required link values', but aren't
+            // parameters in the template.
+            //
+            // Ex:
+            //      template: api/Products/{action}
+            //      required values: { id = "5", action = "Buy", Controller = "CoolProducts" }
+            //
+            //      result: { id = "5", action = "Buy" }
+            var inputValues = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in context.Values)
+            {
+                if (entry.RequiredLinkValues.ContainsKey(kvp.Key))
+                {
+                    var parameter = entry.Template.Parameters
+                        .FirstOrDefault(p => string.Equals(p.Name, kvp.Key, StringComparison.OrdinalIgnoreCase));
+
+                    if (parameter == null)
+                    {
+                        continue;
+                    }
+                }
+
+                inputValues.Add(kvp.Key, kvp.Value);
+            }
+
+            var bindingResult = entry.Binder.GetValues(context.AmbientValues, inputValues);
+            if (bindingResult == null)
+            {
+                // A required parameter in the template didn't get a value.
+                return null;
+            }
+
+            var matched = RouteConstraintMatcher.Match(
+                entry.Constraints,
+                bindingResult.CombinedValues,
+                context.Context,
+                this,
+                RouteDirection.UrlGeneration,
+                _constraintLogger);
+
+            if (!matched)
+            {
+                // A constraint rejected this link.
+                return null;
+            }
+
+            // These values are used to signal to the next route what we would produce if we round-tripped
+            // (generate a link and then parse). In MVC the 'next route' is typically the MvcRouteHandler.
+            var providedValues = new Dictionary<string, object>(
+                bindingResult.AcceptedValues,
+                StringComparer.OrdinalIgnoreCase);
+            providedValues.Add(AttributeRouting.RouteGroupKey, entry.RouteGroup);
+
+            var childContext = new VirtualPathContext(context.Context, context.AmbientValues, context.Values)
+            {
+                ProvidedValues = providedValues,
+            };
+
+            var pathData = _target.GetVirtualPath(childContext);
+            if (pathData != null)
+            {
+                // If path is non-null then the target router short-circuited, we don't expect this
+                // in typical MVC scenarios.
+                return pathData;
+            }
+            else if (!childContext.IsBound)
+            {
+                // The target router has rejected these values. We don't expect this in typical MVC scenarios.
+                return null;
+            }
+
+            var path = entry.Binder.BindValues(bindingResult.AcceptedValues);
+            if (path == null)
+            {
+                return null;
+            }
+
+            return new VirtualPathData(this, path);
+        }
+
         private class RouteInfo
         {
             public ActionDescriptor ActionDescriptor { get; set; }
@@ -301,6 +485,23 @@ namespace Microsoft.AspNet.Mvc.Routing
             public string RouteTemplate { get; set; }
 
             public string Name { get; set; }
+        }
+
+        private class RoutesForRequestMatch
+        {
+            public RoutesForRequestMatch(IList<InnerAttributeRoute> routes, int actionsVersion)
+            {
+                Routes = routes;
+                ActionsVersion = actionsVersion;
+            }
+
+            public IList<InnerAttributeRoute> Routes { get; }
+
+            /// <summary>
+            /// Gets the version of this route. This corresponds to the value of
+            /// <see cref="ActionDescriptorsCollection.Version"/> when this route was created.
+            /// </summary>
+            public int ActionsVersion { get; }
         }
     }
 }
