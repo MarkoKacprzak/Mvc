@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNet.Mvc.Core;
@@ -19,6 +18,8 @@ namespace Microsoft.AspNet.Mvc.Routing
         private readonly IRouter _target;
         private readonly IActionDescriptorsCollectionProvider _actionDescriptorsCollectionProvider;
         private readonly IInlineConstraintResolver _constraintResolver;
+        private static readonly IReadOnlyDictionary<string, object> EmptyRouteValueDictionary =
+            new RouteValueDictionary();
 
         // These loggers are used by the inner route, keep them around to avoid re-creating.
         private readonly ILogger _routeLogger;
@@ -99,20 +100,23 @@ namespace Microsoft.AspNet.Mvc.Routing
             var matchingEntries = new List<AttributeRouteMatchingEntry>();
             foreach (var routeInfo in distinctRouteInfosByGroup)
             {
+                var defaults = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { AttributeRouting.RouteGroupKey, routeInfo.RouteGroup },
+                };
+
                 matchingEntries.Add(new AttributeRouteMatchingEntry()
                 {
                     Order = routeInfo.Order,
                     Precedence = routeInfo.Precedence,
-                    Route = new TemplateRoute(
-                        _target,
-                        routeInfo.RouteTemplate,
-                        defaults: new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
-                        {
-                            { AttributeRouting.RouteGroupKey, routeInfo.RouteGroup },
-                        },
-                        constraints: null,
-                        dataTokens: null,
-                        inlineConstraintResolver: _constraintResolver),
+                    Target = _target,
+                    RouteName = routeInfo.Name,
+                    RouteTemplate = routeInfo.RouteTemplate,
+                    TemplateMatcher = new TemplateMatcher(routeInfo.ParsedTemplate, defaults),
+                    Defaults = defaults,
+                    Constraints = routeInfo.Constraints,
+                    DataTokens = EmptyRouteValueDictionary,
+                    InlineConstraintResolver = _constraintResolver
                 });
             }
 

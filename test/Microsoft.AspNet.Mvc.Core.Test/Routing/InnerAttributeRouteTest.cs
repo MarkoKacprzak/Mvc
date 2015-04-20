@@ -1459,8 +1459,8 @@ namespace Microsoft.AspNet.Mvc.Routing
             Assert.Equal("Index", context.RouteData.Values["action"]);
             Assert.Single(context.RouteData.Values, kvp => kvp.Key == "test_route_group");
 
-            Assert.IsType<TemplateRoute>(context.RouteData.Routers[0]);
-            Assert.Same(next.Object, context.RouteData.Routers[1]);
+            Assert.Equal(1, context.RouteData.Routers.Count);
+            Assert.Equal(next.Object.GetType(), context.RouteData.Routers[0].GetType());
         }
 
         [Fact]
@@ -1502,8 +1502,8 @@ namespace Microsoft.AspNet.Mvc.Routing
 
             Assert.Empty(context.RouteData.Routers);
 
-            Assert.IsType<TemplateRoute>(nestedRouteData.Routers[0]);
-            Assert.Same(next.Object, nestedRouteData.Routers[1]);
+            Assert.Equal(1, nestedRouteData.Routers.Count);
+            Assert.Equal(next.Object.GetType(), nestedRouteData.Routers[0].GetType());
         }
 
         [Fact]
@@ -1545,8 +1545,8 @@ namespace Microsoft.AspNet.Mvc.Routing
 
             Assert.Empty(context.RouteData.Routers);
 
-            Assert.IsType<TemplateRoute>(nestedRouteData.Routers[0]);
-            Assert.Same(next.Object, nestedRouteData.Routers[1]);
+            Assert.Equal(1, nestedRouteData.Routers.Count);
+            Assert.Equal(next.Object.GetType(), nestedRouteData.Routers[0].GetType());
         }
 
         private static RouteContext CreateRouteContext(string requestPath)
@@ -1582,20 +1582,18 @@ namespace Microsoft.AspNet.Mvc.Routing
         private static AttributeRouteMatchingEntry CreateMatchingEntry(IRouter router, string template, int order)
         {
             var routeGroup = string.Format("{0}&&{1}", order, template);
-
+            var inlineConstraintResolver = CreateConstraintResolver();
             var entry = new AttributeRouteMatchingEntry();
-            entry.Route = new TemplateRoute(
-                target: router,
-                routeTemplate: template,
-                defaults: new RouteValueDictionary(new { test_route_group = routeGroup }),
-                constraints: null,
-                dataTokens: null,
-                inlineConstraintResolver: CreateConstraintResolver());
-
-            var routeTemplate = TemplateParser.Parse(template);
-            entry.Precedence = AttributeRoutePrecedence.Compute(routeTemplate);
+            entry.Target = router;
+            entry.RouteTemplate = template;
+            entry.Defaults = new RouteValueDictionary(new { test_route_group = routeGroup });
+            entry.InlineConstraintResolver = inlineConstraintResolver;
+            entry.DataTokens = new RouteValueDictionary();
+            var parsedRouteTemplate = TemplateParser.Parse(template);
+            entry.TemplateMatcher = new TemplateMatcher(parsedRouteTemplate, entry.Defaults);
+            entry.Precedence = AttributeRoutePrecedence.Compute(parsedRouteTemplate);
             entry.Order = order;
-
+            entry.Constraints = GetRouteConstriants(inlineConstraintResolver, template, parsedRouteTemplate);
             return entry;
         }
 
@@ -1661,10 +1659,10 @@ namespace Microsoft.AspNet.Mvc.Routing
                 It.IsAny<string>()))
             .Returns(mockConstraint.Object);
 
-            var entry = new AttributeRouteMatchingEntry()
-            {
-                Route = new TemplateRoute(new StubRouter(), template, mockConstraintResolver.Object)
-            };
+            var entry = new AttributeRouteMatchingEntry();
+            entry.Target = new StubRouter();
+            entry.RouteTemplate = template;
+            entry.InlineConstraintResolver = mockConstraintResolver.Object;
 
             return entry;
         }
@@ -1741,6 +1739,30 @@ namespace Microsoft.AspNet.Mvc.Routing
                 version: 1);
         }
 
+        private static IReadOnlyDictionary<string, IRouteConstraint> GetRouteConstriants(
+            IInlineConstraintResolver inlineConstraintResolver,
+            string template,
+            RouteTemplate parsedRouteTemplate)
+        {
+            var constraintBuilder = new RouteConstraintBuilder(inlineConstraintResolver, template);
+            foreach (var parameter in parsedRouteTemplate.Parameters)
+            {
+                if (parameter.InlineConstraints != null)
+                {
+                    if (parameter.IsOptional)
+                    {
+                        constraintBuilder.SetOptional(parameter.Name);
+                    }
+
+                    foreach (var constraint in parameter.InlineConstraints)
+                    {
+                        constraintBuilder.AddResolvedConstraint(parameter.Name, constraint.Constraint);
+                    }
+                }
+            }
+
+            return constraintBuilder.Build();
+        }
         private class StubRouter : IRouter
         {
             public VirtualPathContext GenerationContext { get; set; }
