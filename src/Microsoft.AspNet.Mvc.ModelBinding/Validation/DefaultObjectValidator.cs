@@ -185,14 +185,8 @@ namespace Microsoft.AspNet.Mvc.ModelBinding.Validation
                     Visited = validationContext.Visited
                 };
 
-                // For a body bound model, we do not include the entire chain upto the body.
-                // Instead we start with an empty prefix.
-                var childKey = string.Empty;
-                if (propertyMetadata.BindingSource != BindingSource.Body)
-                {
-                    var propertyBindingName = propertyMetadata.BinderModelName ?? propertyMetadata.PropertyName;
-                    childKey = ModelBindingHelper.CreatePropertyModelName(currentModelKey, propertyBindingName);
-                }
+                var propertyBindingName = propertyMetadata.BinderModelName ?? propertyMetadata.PropertyName;
+                var childKey = ModelBindingHelper.CreatePropertyModelName(currentModelKey, propertyBindingName);
 
                 if (!ValidateNonVisitedNodeAndChildren(
                     childKey,

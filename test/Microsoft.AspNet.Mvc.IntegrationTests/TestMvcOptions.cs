@@ -2,11 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
-using Microsoft.AspNet.Mvc;
-using Microsoft.AspNet.Mvc.Razor;
 using Microsoft.Framework.OptionsModel;
 
-namespace Microsoft.AspNet.Mvc.Core
+namespace Microsoft.AspNet.Mvc.IntegrationTests
 {
     public class TestMvcOptions : IOptions<MvcOptions>
     {

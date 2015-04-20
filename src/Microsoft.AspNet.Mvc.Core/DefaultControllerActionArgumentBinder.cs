@@ -63,7 +63,7 @@ namespace Microsoft.AspNet.Mvc
             return actionArguments;
         }
 
-        public async Task<object> BindModelAsync(
+        public async Task<ModelBindingResult> BindModelAsync(
             ParameterDescriptor parameter,
             ModelStateDictionary modelState,
             OperationBindingContext operationContext)
@@ -80,22 +80,22 @@ namespace Microsoft.AspNet.Mvc
             var modelBindingResult = await operationContext.ModelBinder.BindModelAsync(modelBindingContext);
             if (modelBindingResult != null && modelBindingResult.IsModelSet)
             {
+                var key = modelBindingResult.Key;
                 var modelExplorer = new ModelExplorer(
                     _modelMetadataProvider,
                     metadata,
                     modelBindingResult.Model);
 
                 var validationContext = new ModelValidationContext(
-                    modelBindingResult.Key,
+                    key,
                     modelBindingContext.BindingSource,
                     operationContext.ValidatorProvider,
                     modelState,
                     modelExplorer);
                 _validator.Validate(validationContext);
-                return modelBindingResult.Model;
             }
 
-            return null;
+            return modelBindingResult;
         }
 
         private void ActivateProperties(object controller, Type containerType, Dictionary<string, object> properties)
@@ -123,10 +123,10 @@ namespace Microsoft.AspNet.Mvc
         {
             foreach (var parameter in parameterMetadata)
             {
-                var model = await BindModelAsync(parameter, modelState, operationContext);
-                if (model != null)
+                var modelBindingResult = await BindModelAsync(parameter, modelState, operationContext);
+                if (modelBindingResult != null && modelBindingResult.IsModelSet)
                 {
-                    arguments[parameter.Name] = model;
+                    arguments[parameter.Name] = modelBindingResult.Model;
                 }
             }
         }
