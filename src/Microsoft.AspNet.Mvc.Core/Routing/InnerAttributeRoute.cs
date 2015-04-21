@@ -119,7 +119,6 @@ namespace Microsoft.AspNet.Mvc.Routing
                 var oldRouteData = context.RouteData;
 
                 var newRouteData = new RouteData(oldRouteData);
-                MergeValues(newRouteData.DataTokens, matchingEntry.DataTokens);
                 newRouteData.Routers.Add(matchingEntry.Target);
                 MergeValues(newRouteData.Values, values);
 
@@ -297,20 +296,6 @@ namespace Microsoft.AspNet.Mvc.Routing
         private static void MergeValues(
                 IDictionary<string, object> destination,
                 IDictionary<string, object> values)
-        {
-            foreach (var kvp in values)
-            {
-                // This will replace the original value for the specified key.
-                // Values from the matched route will take preference over previous
-                // data in the route context.
-                destination[kvp.Key] = kvp.Value;
-            }
-        }
-
-        // Needed because IDictionary<> is not an IReadOnlyDictionary<>
-        private static void MergeValues(
-            IDictionary<string, object> destination,
-            IReadOnlyDictionary<string, object> values)
         {
             foreach (var kvp in values)
             {

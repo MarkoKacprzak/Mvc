@@ -32,12 +32,6 @@ namespace Microsoft.AspNet.Mvc.Routing
 
         public TemplateMatcher TemplateMatcher { get; set; }
 
-        public IReadOnlyDictionary<string, object> Defaults { get; set; }
-
         public IReadOnlyDictionary<string, IRouteConstraint> Constraints { get; set; }
-
-        public IReadOnlyDictionary<string, object> DataTokens { get; set; }
-
-        public IInlineConstraintResolver InlineConstraintResolver { get; set; }
     }
 }

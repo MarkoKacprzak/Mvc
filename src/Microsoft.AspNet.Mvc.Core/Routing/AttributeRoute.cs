@@ -18,8 +18,6 @@ namespace Microsoft.AspNet.Mvc.Routing
         private readonly IRouter _target;
         private readonly IActionDescriptorsCollectionProvider _actionDescriptorsCollectionProvider;
         private readonly IInlineConstraintResolver _constraintResolver;
-        private static readonly IReadOnlyDictionary<string, object> EmptyRouteValueDictionary =
-            new RouteValueDictionary();
 
         // These loggers are used by the inner route, keep them around to avoid re-creating.
         private readonly ILogger _routeLogger;
@@ -100,11 +98,6 @@ namespace Microsoft.AspNet.Mvc.Routing
             var matchingEntries = new List<AttributeRouteMatchingEntry>();
             foreach (var routeInfo in distinctRouteInfosByGroup)
             {
-                var defaults = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
-                {
-                    { AttributeRouting.RouteGroupKey, routeInfo.RouteGroup },
-                };
-
                 matchingEntries.Add(new AttributeRouteMatchingEntry()
                 {
                     Order = routeInfo.Order,
@@ -112,11 +105,13 @@ namespace Microsoft.AspNet.Mvc.Routing
                     Target = _target,
                     RouteName = routeInfo.Name,
                     RouteTemplate = routeInfo.RouteTemplate,
-                    TemplateMatcher = new TemplateMatcher(routeInfo.ParsedTemplate, defaults),
-                    Defaults = defaults,
-                    Constraints = routeInfo.Constraints,
-                    DataTokens = EmptyRouteValueDictionary,
-                    InlineConstraintResolver = _constraintResolver
+                    TemplateMatcher = new TemplateMatcher(
+                        routeInfo.ParsedTemplate,
+                        new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            { AttributeRouting.RouteGroupKey, routeInfo.RouteGroup }
+                        }),
+                    Constraints = routeInfo.Constraints
                 });
             }
 

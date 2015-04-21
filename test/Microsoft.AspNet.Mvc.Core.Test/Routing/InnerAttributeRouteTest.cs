@@ -1582,18 +1582,16 @@ namespace Microsoft.AspNet.Mvc.Routing
         private static AttributeRouteMatchingEntry CreateMatchingEntry(IRouter router, string template, int order)
         {
             var routeGroup = string.Format("{0}&&{1}", order, template);
-            var inlineConstraintResolver = CreateConstraintResolver();
             var entry = new AttributeRouteMatchingEntry();
             entry.Target = router;
             entry.RouteTemplate = template;
-            entry.Defaults = new RouteValueDictionary(new { test_route_group = routeGroup });
-            entry.InlineConstraintResolver = inlineConstraintResolver;
-            entry.DataTokens = new RouteValueDictionary();
             var parsedRouteTemplate = TemplateParser.Parse(template);
-            entry.TemplateMatcher = new TemplateMatcher(parsedRouteTemplate, entry.Defaults);
+            entry.TemplateMatcher = new TemplateMatcher(
+                parsedRouteTemplate,
+                new RouteValueDictionary(new { test_route_group = routeGroup }));
             entry.Precedence = AttributeRoutePrecedence.Compute(parsedRouteTemplate);
             entry.Order = order;
-            entry.Constraints = GetRouteConstriants(inlineConstraintResolver, template, parsedRouteTemplate);
+            entry.Constraints = GetRouteConstriants(CreateConstraintResolver(), template, parsedRouteTemplate);
             return entry;
         }
 
@@ -1662,7 +1660,6 @@ namespace Microsoft.AspNet.Mvc.Routing
             var entry = new AttributeRouteMatchingEntry();
             entry.Target = new StubRouter();
             entry.RouteTemplate = template;
-            entry.InlineConstraintResolver = mockConstraintResolver.Object;
 
             return entry;
         }
@@ -1726,7 +1723,9 @@ namespace Microsoft.AspNet.Mvc.Routing
                 version: 1);
         }
 
-        private static InnerAttributeRoute CreateRoutingAttributeRoute(ILoggerFactory loggerFactory = null, params AttributeRouteMatchingEntry[] entries)
+        private static InnerAttributeRoute CreateRoutingAttributeRoute(
+            ILoggerFactory loggerFactory = null,
+            params AttributeRouteMatchingEntry[] entries)
         {
             loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
 
